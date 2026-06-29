@@ -101,6 +101,11 @@ func (k *kvm) isGrabbed() bool {
 func (k *kvm) forceRelease(reason string) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
+	k.releaseLocked(reason)
+}
+
+// releaseLocked drops the grab without re-grabbing. Caller must hold k.mu.
+func (k *kvm) releaseLocked(reason string) {
 	if !k.grabbed {
 		return
 	}
@@ -110,6 +115,40 @@ func (k *kvm) forceRelease(reason string) {
 	k.grabbed = false
 	k.rep.ClearState() // target is gone — just drop local state, don't send
 	fmt.Printf(">>> %s — input released; press %s to re-grab\n", reason, keyName(k.toggleKey))
+}
+
+// trackIfNew adds d to the active set unless a device with the same path is
+// already tracked, returning whether it was added (so the caller starts reading).
+func (k *kvm) trackIfNew(d *device) bool {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	for _, e := range k.devs {
+		if e.path == d.path {
+			return false
+		}
+	}
+	k.devs = append(k.devs, d)
+	return true
+}
+
+// deviceLost handles an input node going away (e.g. a wireless receiver was
+// unplugged, or it slept). We drop it from the active set and release the grab —
+// input hardware vanished, so don't leave the local session locked out. The
+// supervisor re-adds the device when it returns; the grab comes back only on the
+// next toggle press, like a bridge disconnect.
+func (k *kvm) deviceLost(d *device) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	kept := k.devs[:0]
+	for _, e := range k.devs {
+		if e != d {
+			kept = append(kept, e)
+		}
+	}
+	k.devs = kept
+	d.file.Close()
+	fmt.Printf(">>> device gone: %s (%s) — waiting for it to come back\n", d.name, d.path)
+	k.releaseLocked("input device disappeared")
 }
 
 // watchLink polls the bridge link while grabbed and releases the grab the moment
@@ -125,12 +164,30 @@ func (k *kvm) watchLink(sink Sink) {
 	}
 }
 
-// readDevice reads input_event records and feeds them to the kvm controller.
-// This is where, later, we'll build HID reports and ship them to the ESP32
-// (only while grabbed).
-func readDevice(k *kvm, d *device) {
-	defer d.file.Close()
+// superviseDevices polls for configured devices (re)appearing — a wireless
+// receiver plugged back in, a device that slept and woke — and starts reading
+// them, without restarting the daemon. Disappearance is handled by deviceLost;
+// this is the other half that brings them back.
+func (k *kvm) superviseDevices(cfg *Config) {
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	for range t.C {
+		devs, err := discover(cfg)
+		if err != nil {
+			continue // nothing configured is present yet — keep waiting
+		}
+		for _, d := range devs {
+			if k.trackIfNew(d) {
+				go readDevice(k, d)
+			} else {
+				d.file.Close() // already reading this node — drop the probe fd
+			}
+		}
+	}
+}
 
+// readDevice reads input_event records and feeds them to the kvm controller.
+func readDevice(k *kvm, d *device) {
 	role := "input"
 	switch {
 	case d.kbd && d.mice:
@@ -145,9 +202,10 @@ func readDevice(k *kvm, d *device) {
 	buf := make([]byte, eventSize)
 	for {
 		if _, err := io.ReadFull(d.file, buf); err != nil {
-			if err != io.EOF && err != io.ErrUnexpectedEOF && !errors.Is(err, os.ErrClosed) {
-				fmt.Fprintf(os.Stderr, "read %s: %v\n", d.path, err)
+			if errors.Is(err, os.ErrClosed) {
+				return // we closed it (shutdown / already dropped) — nothing to do
 			}
+			k.deviceLost(d) // node went away: release grab, wait for it to return
 			return
 		}
 		ev := inputEvent{
@@ -453,7 +511,8 @@ func main() {
 	for _, d := range devs {
 		go readDevice(k, d)
 	}
-	go k.watchLink(sink) // release the grab if the bridge link drops
+	go k.watchLink(sink)        // release the grab if the bridge link drops
+	go k.superviseDevices(&cfg) // re-attach devices that disappear and come back
 	fmt.Println("---")
 
 	sig := make(chan os.Signal, 1)
