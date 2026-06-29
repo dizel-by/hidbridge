@@ -138,7 +138,12 @@ static const char *hid_string_descriptor[] = {
 
 #define TUSB_DESC_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN)
 static const uint8_t hid_configuration_descriptor[] = {
-    TUD_CONFIG_DESCRIPTOR(1, 1, 0, TUSB_DESC_TOTAL_LEN, TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100),
+    // Self-powered (the board is powered independently of the target's port) +
+    // remote-wakeup. Declaring self-powered stops the host from policing the USB
+    // suspend current budget — a bus-powered claim makes macOS treat the always-on
+    // ESP32 as a misbehaving device and refuse to bring its endpoint back on wake.
+    TUD_CONFIG_DESCRIPTOR(1, 1, 0, TUSB_DESC_TOTAL_LEN,
+                          TUSB_DESC_CONFIG_ATT_SELF_POWERED | TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100),
     // poll interval 1 ms so the host drains reports at up to 1000 Hz.
     TUD_HID_DESCRIPTOR(0, 4, false, sizeof(hid_report_descriptor), 0x81, 16, 1),
 };
@@ -158,6 +163,19 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_
                            uint8_t const *buffer, uint16_t bufsize)
 {
     (void)instance; (void)report_id; (void)type; (void)buffer; (void)bufsize;
+}
+
+// Bus suspend/resume — fired when the target sleeps/wakes. Logged so the monitor
+// shows whether a resume actually reaches us when the host is woken by other
+// means (its own keyboard, lid, power button); without that resume the device
+// stays parked and send_report's remote-wakeup path is what recovers it.
+void tud_suspend_cb(bool remote_wakeup_en)
+{
+    ESP_LOGI(TAG, "USB suspend (remote_wakeup_en=%d)", remote_wakeup_en);
+}
+void tud_resume_cb(void)
+{
+    ESP_LOGI(TAG, "USB resume");
 }
 
 // ---- Frame parser (reentrant: one state per transport) ----
@@ -273,6 +291,14 @@ static void apply_config(const uint8_t *p, uint8_t len)
 static void send_report(uint8_t type, const uint8_t *payload)
 {
     xSemaphoreTake(hid_mtx, portMAX_DELAY);
+    // Host asleep => the USB bus is suspended and tud_hid_ready() stays false.
+    // Ask the host to resume (works because the config descriptor advertises
+    // REMOTE_WAKEUP and the host enabled it), then wait for the bus to come
+    // back so this very keypress/click is what wakes it instead of being lost.
+    if (tud_suspended()) {
+        tud_remote_wakeup();
+        for (int i = 0; i < 1000 && tud_suspended(); i++) vTaskDelay(pdMS_TO_TICKS(1));
+    }
     for (int i = 0; i < 50 && !tud_hid_ready(); i++) vTaskDelay(pdMS_TO_TICKS(1));
     if (tud_hid_ready()) tud_hid_report(type, payload, payload_len(type));
     xSemaphoreGive(hid_mtx);
