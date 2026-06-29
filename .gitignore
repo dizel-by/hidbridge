@@ -1,0 +1,22 @@
+# Go binary
+/hidbridge
+
+# secrets / machine-specific
+firmware/*/.env
+/config.json
+
+# ESP-IDF build artifacts
+firmware/*/build/
+firmware/*/managed_components/
+firmware/*/sdkconfig
+firmware/*/sdkconfig.old
+firmware/*/dependencies.lock
+
+# built helper tool
+tools/cp210x-cfg
+
+# editor / local tool settings
+.claude/settings.local.json
+
+# machine-specific udev rules (contains this board's serial)
+linux/

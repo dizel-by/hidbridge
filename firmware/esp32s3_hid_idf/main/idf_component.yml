@@ -1,0 +1,5 @@
+dependencies:
+  espressif/esp_tinyusb: "^1.4.0"
+  espressif/mdns: "^1.2.0"
+  idf:
+    version: ">=5.0"

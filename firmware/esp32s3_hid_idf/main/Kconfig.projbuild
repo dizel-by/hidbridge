@@ -1,0 +1,28 @@
+menu "hidbridge"
+
+    config HIDBRIDGE_BLE_NAME
+        string "BLE device name"
+        default "hidbridge"
+        help
+            Advertised BLE name; the daemon scans for this with -ble.
+
+    config HIDBRIDGE_WIFI_SSID
+        string "WiFi SSID"
+        default "changeme"
+        help
+            Wi-Fi network to join. Left at "changeme" (or empty) => Wi-Fi is not
+            started (cable + BLE only). Set it to enable the Wi-Fi/TCP transport.
+
+    config HIDBRIDGE_WIFI_PASSWORD
+        string "WiFi password"
+        default "changeme"
+
+    config HIDBRIDGE_TCP_PORT
+        int "Wi-Fi TCP port"
+        default 3232
+
+    config HIDBRIDGE_MDNS_HOSTNAME
+        string "Wi-Fi mDNS hostname (without .local)"
+        default "hidbridge"
+
+endmenu

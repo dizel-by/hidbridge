@@ -1,0 +1,12 @@
+{
+  "_comment": "Copy to config.json (gitignored) and edit for your machine. List one node per physical device — sibling HID interfaces (Consumer/System Control, where keys like Calculator live) are pulled in automatically. Run with no transport to see device names.",
+  "devices": [
+    "Logitech Wireless Receiver Mouse",
+    "Dell Computer Corp Dell Universal Receiver"
+  ],
+  "toggleKey": 140,
+  "invertScroll": true,
+  "serial": "/dev/ttyUSB0",
+  "ble": "hidbridge",
+  "net": "hidbridge.local:3232"
+}
