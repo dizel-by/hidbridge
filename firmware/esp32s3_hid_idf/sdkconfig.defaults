@@ -20,3 +20,12 @@ CONFIG_BT_NIMBLE_ENABLED=y
 # NimBLE + TinyUSB don't fit the default 1 MB app partition — use a custom table.
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# 16 MB flash (matches the board) so the dual 1.5 MB OTA slots fit.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+
+# OTA with rollback: a freshly flashed image boots as "pending verify"; if it
+# fails to reach app_main's esp_ota_mark_app_valid_cancel_rollback() the
+# bootloader reverts to the previous slot on the next reset.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y

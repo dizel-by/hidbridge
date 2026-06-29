@@ -132,6 +132,29 @@ Each transport flag has a sensible default and an optional override:
 ./hidbridge -ble=other-name    # override with =value
 ```
 
+## Firmware updates (OTA)
+
+After the first cable flash, the firmware can be updated **over the air** — no
+UART cable — over whichever transport you use:
+
+```sh
+cd firmware/esp32s3_hid_idf && ./idf.sh build && cd ../..
+./hidbridge -net -ota firmware/esp32s3_hid_idf/build/hidbridge.bin
+```
+
+The image streams into the board's spare OTA slot and is hash-verified before it
+boots; a failed transfer leaves the running firmware untouched, and a new image
+that won't start is rolled back automatically. Updates are gated by a shared
+token (`otaToken` in `config.json`, matching the board's `OTA_TOKEN`). See the
+[firmware README](firmware/esp32s3_hid_idf/README.md#ota-over-the-air-firmware-update).
+
+## Status page
+
+With Wi-Fi enabled, the board serves a live status page at
+**`http://hidbridge.local/`** — firmware version, running OTA slot, uptime, and
+emulation counters (keystrokes, clicks, report totals since boot).
+`http://hidbridge.local/json` returns the same as JSON.
+
 ## Configuration
 
 All machine-specific settings live in **`config.json`** (no recompiling). Copy
@@ -151,7 +174,8 @@ cp config.example.json config.json
   "invertScroll": true,        // invert vertical wheel (handy for macOS targets)
   "serial": "/dev/ttyUSB0",    // default for bare -serial
   "ble": "hidbridge",          // default for bare -ble
-  "net": "hidbridge.local:3232"// default for bare -net
+  "net": "hidbridge.local:3232",// default for bare -net
+  "otaToken": "changeme"       // shared secret for -ota (must match board's OTA_TOKEN)
 }
 ```
 

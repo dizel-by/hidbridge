@@ -25,4 +25,12 @@ menu "hidbridge"
         string "Wi-Fi mDNS hostname (without .local)"
         default "hidbridge"
 
+    config HIDBRIDGE_OTA_TOKEN
+        string "OTA update token"
+        default "changeme"
+        help
+            Shared secret the daemon must send (in the OTA_BEGIN frame) before the
+            board accepts a firmware update. Set it (here or in .env) and put the
+            same value in the daemon's config.json "otaToken".
+
 endmenu

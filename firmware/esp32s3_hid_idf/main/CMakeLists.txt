@@ -17,7 +17,7 @@ if(EXISTS "${ENV_FILE}")
             set(_val "${CMAKE_MATCH_2}")
             string(REGEX REPLACE "^\"(.*)\"$" "\\1" _val "${_val}")  # strip "quotes"
             string(REGEX REPLACE "^'(.*)'$" "\\1" _val "${_val}")    # strip 'quotes'
-            if(_key STREQUAL "WIFI_SSID" OR _key STREQUAL "WIFI_PASSWORD")
+            if(_key STREQUAL "WIFI_SSID" OR _key STREQUAL "WIFI_PASSWORD" OR _key STREQUAL "OTA_TOKEN")
                 target_compile_definitions(${COMPONENT_LIB} PRIVATE ${_key}="${_val}")
                 message(STATUS "hidbridge: ${_key} loaded from .env")
             endif()

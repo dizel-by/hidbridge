@@ -338,6 +338,8 @@ func main() {
 	wifiPass := flag.String("wifi-pass", "", "Wi-Fi password to save alongside -wifi-ssid")
 	verbose := flag.Bool("v", false, "also print decoded events while forwarding")
 	selftest := flag.Bool("selftest", false, "send a test mouse+key sequence to -serial and exit")
+	otaFile := flag.String("ota", "", "flash a firmware .bin to the ESP32 over the chosen transport (-serial/-net/-ble), then exit")
+	otaToken := flag.String("ota-token", "", "OTA token (overrides config.json otaToken)")
 	invertScroll := flag.Bool("invert-scroll", cfg.InvertScroll, "invert vertical scroll wheel direction")
 	coalesceMs := flag.Int("coalesce", 0, "coalesce mouse motion into one report every N ms (0=off; try 4-8 for Wi-Fi)")
 	flag.Parse()
@@ -407,6 +409,18 @@ func main() {
 		fmt.Println("transport: none (debug mode — reports are printed, not sent)")
 	}
 	defer sink.Close()
+
+	if *otaFile != "" {
+		token := cfg.OTAToken
+		if *otaToken != "" {
+			token = *otaToken
+		}
+		if err := runOTA(sink, *otaFile, token); err != nil {
+			fmt.Fprintf(os.Stderr, "ota: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	if *selftest {
 		fmt.Println("selftest: wiggling mouse, then tapping 'a' …")

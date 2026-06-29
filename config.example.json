@@ -8,5 +8,6 @@
   "invertScroll": true,
   "serial": "/dev/ttyUSB0",
   "ble": "hidbridge",
-  "net": "hidbridge.local:3232"
+  "net": "hidbridge.local:3232",
+  "otaToken": "changeme"
 }

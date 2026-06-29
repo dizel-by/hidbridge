@@ -22,6 +22,9 @@ type Config struct {
 	Serial string `json:"serial"`
 	BLE    string `json:"ble"`
 	Net    string `json:"net"`
+	// OTAToken is the shared secret sent with -ota firmware updates; it must
+	// match the board's OTA_TOKEN (.env / Kconfig).
+	OTAToken string `json:"otaToken"`
 }
 
 func defaultConfig() Config {
@@ -30,6 +33,7 @@ func defaultConfig() Config {
 		Serial:    "/dev/ttyUSB0",
 		BLE:       "hidbridge",
 		Net:       "hidbridge.local:3232",
+		OTAToken:  "changeme",
 	}
 }
 

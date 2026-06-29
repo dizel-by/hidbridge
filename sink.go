@@ -21,6 +21,9 @@ const (
 	typeMouse    = 0x02
 	typeControl  = 0x03 // 1-byte payload: enable/disable the ESP32 radios
 	typeConfig   = 0x04 // length-prefixed payload: Wi-Fi credentials
+	typeOTABegin = 0x05 // length-prefixed: tokenLen, token, imageSize[4] LE
+	typeOTAData  = 0x06 // 16-bit length, then a firmware chunk
+	typeOTAEnd   = 0x07 // length-prefixed: imageSize[4] LE (sanity check)
 )
 
 // Control command bits (must match the firmware).

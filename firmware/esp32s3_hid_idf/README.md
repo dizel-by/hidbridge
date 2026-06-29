@@ -93,9 +93,49 @@ Sent as a control frame (`type 3`) on the same serial link; the cable transport 
 this control channel are always available. Default (blank NVS) is both on (Wi-Fi
 still also needs an SSID).
 
+## OTA (over-the-air firmware update)
+
+After the **first** cable flash (which lays down the dual-slot partition table),
+new firmware can be pushed without the UART cable, over whichever transport the
+daemon is using:
+
+```sh
+idf.py build                                   # or ./idf.sh build
+./hidbridge -net  -ota build/hidbridge.bin     # over Wi-Fi (fast)
+./hidbridge -serial -ota build/hidbridge.bin   # over cable (~10-12 s)
+./hidbridge -ble  -ota build/hidbridge.bin     # over BLE (slow)
+```
+
+The image streams into the **inactive** OTA slot; `esp_ota_end` verifies its hash
+before the board switches the boot slot and reboots, so an interrupted or
+corrupted transfer just fails and leaves the running firmware intact. Rollback is
+enabled: if a new image crashes before reaching `app_main`, the bootloader reverts
+to the previous slot on the next reset.
+
+**Token:** updates must present a shared secret (`OTA_TOKEN`, from `.env` or
+Kconfig, default `changeme`) that matches the daemon's `config.json` `otaToken`
+(or `-ota-token`). A wrong token is rejected (`OTA: bad token` in the log). Watch
+the monitor for `OTA: complete` to confirm success.
+
+## Status web page
+
+When Wi-Fi is up, the board serves a small status page at
+**`http://hidbridge.local/`** (port 80): firmware version & build, the running OTA
+slot, last reset reason, uptime, and live emulation counters — keystrokes, mouse
+clicks, and keyboard/mouse report totals since boot. The page auto-refreshes every
+5 s; `http://hidbridge.local/json` returns the same data as JSON for scripting.
+
+```sh
+curl http://hidbridge.local/json
+```
+
+(Only available with the Wi-Fi transport enabled — it's a network service.)
+
 ## Console / logs
 
-Disabled (`CONFIG_ESP_CONSOLE_UART_NONE=y`) because UART0 carries binary data.
+Disabled (`CONFIG_ESP_CONSOLE_UART_NONE=y`) because UART0 carries binary data —
+so app logs don't appear on the UART monitor; OTA status is written to UART0 TX
+directly (see OTA above), and runtime info is on the status web page.
 
 ## Device names seen by the target
 
@@ -108,5 +148,8 @@ device, set a custom `tusb_desc_device_t` via `.device_descriptor`.
 
 ## Partitions
 
-NimBLE + TinyUSB use a custom `partitions.csv` (1.7 MB app). The image is ~0.5 MB,
-so it fits comfortably (works on 2 MB flash and up).
+Custom `partitions.csv`: two **OTA app slots** of 1.5 MB each (`ota_0`/`ota_1`)
+plus `otadata`, so firmware can be updated over the air with rollback (see OTA
+above). The image is ~1 MB, so it fits a slot with room to spare. The table ends
+at ~3.3 MB; `sdkconfig.defaults` sets 16 MB flash to match the board (anything
+≥4 MB fits the table).

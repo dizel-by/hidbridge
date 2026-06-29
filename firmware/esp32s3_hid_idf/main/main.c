@@ -47,6 +47,10 @@
 #include "esp_netif.h"
 #include "mdns.h"
 #include "lwip/sockets.h"
+#include "esp_ota_ops.h"
+#include "esp_app_desc.h"
+#include "esp_http_server.h"
+#include "esp_timer.h"
 
 static const char *TAG = "hidbridge";
 
@@ -60,6 +64,12 @@ static const char *TAG = "hidbridge";
 #define WIFI_PASSWORD CONFIG_HIDBRIDGE_WIFI_PASSWORD
 #endif
 
+// Shared secret an OTA update must present (in the OTA_BEGIN frame) before the
+// board accepts new firmware. From .env (compile define) or the Kconfig default.
+#ifndef OTA_TOKEN
+#define OTA_TOKEN CONFIG_HIDBRIDGE_OTA_TOKEN
+#endif
+
 // Effective Wi-Fi credentials: NVS (set over serial) overrides the compile-time
 // .env/Kconfig defaults, so a generic firmware can be configured without rebuild.
 static char g_ssid[33];
@@ -68,14 +78,18 @@ static char g_pass[64];
 // ---- UART (data from PC over the cable) ----
 #define DATA_UART   UART_NUM_0
 #define DATA_BAUD   921600
-#define DATA_RX_BUF 2048
+#define DATA_RX_BUF 4096 // headroom so OTA bursts don't overrun the UART FIFO
 #define DATA_TX_PIN 43
 #define DATA_RX_PIN 44
 
 // ---- Frame types: 1/2 are HID report IDs, 3/4 are control/config commands ----
 // type 4 (config) is length-prefixed (0xAB,4,len,payload[len],csum) so it can
 // carry variable-length data; types 1/2/3 are fixed length.
-enum { RID_KEYBOARD = 1, RID_MOUSE = 2, TYPE_CONTROL = 3, TYPE_CONFIG = 4 };
+// OTA frames: BEGIN (token + image size) and END (size) are length-prefixed like
+// config; DATA carries a 16-bit length so chunks can exceed the 128-byte payload
+// buffer and stream straight into flash.
+enum { RID_KEYBOARD = 1, RID_MOUSE = 2, TYPE_CONTROL = 3, TYPE_CONFIG = 4,
+       TYPE_OTA_BEGIN = 5, TYPE_OTA_DATA = 6, TYPE_OTA_END = 7 };
 
 // Control command bits (1-byte payload of a TYPE_CONTROL frame):
 //   bit0 BLE target (1=on)   bit1 apply BLE
@@ -179,9 +193,13 @@ void tud_resume_cb(void)
 }
 
 // ---- Frame parser (reentrant: one state per transport) ----
-enum { S_SYNC, S_TYPE, S_LEN, S_PAYLOAD, S_CSUM };
+// S_OTA_* handle the 16-bit-length OTA_DATA frame, streaming the chunk into the
+// shared ota_buf instead of the 128-byte payload[].
+enum { S_SYNC, S_TYPE, S_LEN, S_PAYLOAD, S_CSUM,
+       S_OTA_L0, S_OTA_L1, S_OTA_DATA, S_OTA_CSUM };
 typedef struct {
     uint8_t st, type, payload[128], need, got, csum;
+    uint16_t olen, ogot; // OTA_DATA chunk length / bytes received
 } parser_t;
 
 static SemaphoreHandle_t hid_mtx; // serialize tud_hid_report across transports
@@ -288,9 +306,143 @@ static void apply_config(const uint8_t *p, uint8_t len)
     esp_restart();
 }
 
+// ---- OTA (firmware update streamed in over any transport) ----
+static esp_ota_handle_t g_ota_handle;
+static const esp_partition_t *g_ota_part;
+static bool g_ota_active;
+static size_t g_ota_written;
+static uint8_t ota_buf[1024]; // one OTA at a time, so a single shared chunk buffer
+
+// ota_status prints a line on UART0 TX (ESP->PC). The app console is disabled
+// (UART0 carries binary HID data), so ESP_LOGI is invisible; this TX direction is
+// otherwise unused, so a serial monitor shows OTA progress even when the update
+// itself arrives over Wi-Fi or BLE. This is how you see why an OTA failed.
+static void ota_status(const char *msg)
+{
+    uart_write_bytes(DATA_UART, msg, strlen(msg));
+}
+
+// ota_begin validates the token, picks the inactive slot and erases just enough
+// of it for the incoming image. payload: tokenLen, token[tokenLen], size[4] LE.
+static void ota_begin(const uint8_t *p, uint8_t len)
+{
+    if (len < 1) return;
+    uint8_t tl = p[0];
+    if ((size_t)1 + tl + 4 > len) { ota_status("OTA: malformed begin\r\n"); return; }
+    if (tl != strlen(OTA_TOKEN) || memcmp(p + 1, OTA_TOKEN, tl) != 0) {
+        ota_status("OTA: bad token, rejected\r\n");
+        return;
+    }
+    const uint8_t *s = p + 1 + tl;
+    uint32_t size = s[0] | (s[1] << 8) | (s[2] << 16) | ((uint32_t)s[3] << 24);
+
+    if (g_ota_active) { esp_ota_abort(g_ota_handle); g_ota_active = false; }
+    g_ota_part = esp_ota_get_next_update_partition(NULL);
+    if (!g_ota_part) { ota_status("OTA: no update partition\r\n"); return; }
+    esp_err_t e = esp_ota_begin(g_ota_part, size, &g_ota_handle);
+    if (e != ESP_OK) {
+        ota_status("OTA: begin failed\r\n");
+        ESP_LOGE(TAG, "OTA: begin failed: %s", esp_err_to_name(e));
+        return;
+    }
+    g_ota_active = true;
+    g_ota_written = 0;
+    char buf[96];
+    snprintf(buf, sizeof(buf), "OTA: started -> %s (%u bytes)\r\n",
+             g_ota_part->label, (unsigned)size);
+    ota_status(buf);
+}
+
+static void ota_write_chunk(const uint8_t *data, uint16_t len)
+{
+    if (!g_ota_active) return;
+    esp_err_t e = esp_ota_write(g_ota_handle, data, len);
+    if (e != ESP_OK) {
+        ota_status("OTA: write failed -> abort\r\n");
+        ESP_LOGE(TAG, "OTA: write failed: %s", esp_err_to_name(e));
+        esp_ota_abort(g_ota_handle);
+        g_ota_active = false;
+        return;
+    }
+    g_ota_written += len;
+}
+
+// ota_end finalizes: esp_ota_end verifies the image hash, then we switch the boot
+// slot and reboot. A bad/truncated image fails here and leaves the running
+// firmware untouched. payload: size[4] LE (sanity check against bytes received).
+static void ota_end(const uint8_t *p, uint8_t len)
+{
+    if (!g_ota_active) { ota_status("OTA: end without begin (nothing received)\r\n"); return; }
+    if (len >= 4) {
+        uint32_t total = p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24);
+        if (total != g_ota_written) {
+            char buf[96];
+            snprintf(buf, sizeof(buf), "OTA: size mismatch (got %u want %u) -> abort\r\n",
+                     (unsigned)g_ota_written, (unsigned)total);
+            ota_status(buf);
+            esp_ota_abort(g_ota_handle);
+            g_ota_active = false;
+            return;
+        }
+    }
+    esp_err_t e = esp_ota_end(g_ota_handle);
+    g_ota_active = false;
+    if (e != ESP_OK) {
+        ota_status("OTA: validate failed (bad image)\r\n");
+        ESP_LOGE(TAG, "OTA: validate failed: %s", esp_err_to_name(e));
+        return;
+    }
+    if ((e = esp_ota_set_boot_partition(g_ota_part)) != ESP_OK) {
+        ota_status("OTA: set boot failed\r\n");
+        ESP_LOGE(TAG, "OTA: set boot failed: %s", esp_err_to_name(e));
+        return;
+    }
+    char buf[96];
+    snprintf(buf, sizeof(buf), "OTA: complete (%u bytes) -> reboot into %s\r\n",
+             (unsigned)g_ota_written, g_ota_part->label);
+    ota_status(buf);
+    vTaskDelay(pdMS_TO_TICKS(200)); // let the bytes drain
+    esp_restart();
+}
+
+// ---- Emulation stats (served by the web server) ----
+static struct {
+    uint32_t kbd_reports, mouse_reports, keystrokes, clicks;
+} g_stats;
+static uint8_t g_prev_keys[6]; // last keyboard report's key slots, to detect new presses
+static uint8_t g_prev_btn;     // last mouse button mask, to detect new clicks
+
+// account_report counts keystrokes/clicks from a report. The daemon sends full
+// boot-keyboard snapshots and mouse button masks, so a "keystroke"/"click" is a
+// key/button that wasn't held in the previous report. Called under hid_mtx.
+static void account_report(uint8_t type, const uint8_t *payload)
+{
+    if (type == RID_KEYBOARD) {
+        g_stats.kbd_reports++;
+        for (int i = 0; i < 6; i++) {        // key slots are payload[2..7]
+            uint8_t k = payload[2 + i];
+            if (!k) continue;
+            bool held = false;
+            for (int j = 0; j < 6; j++) {
+                if (g_prev_keys[j] == k) { held = true; break; }
+            }
+            if (!held) g_stats.keystrokes++;
+        }
+        memcpy(g_prev_keys, payload + 2, 6);
+    } else if (type == RID_MOUSE) {
+        g_stats.mouse_reports++;
+        uint8_t newly = payload[0] & ~g_prev_btn; // buttons pressed since last report
+        for (int b = 0; b < 8; b++) {
+            if (newly & (1 << b)) g_stats.clicks++;
+        }
+        g_prev_btn = payload[0];
+    }
+}
+
 static void send_report(uint8_t type, const uint8_t *payload)
 {
     xSemaphoreTake(hid_mtx, portMAX_DELAY);
+    account_report(type, payload);
     // Host asleep => the USB bus is suspended and tud_hid_ready() stays false.
     // Ask the host to resume (works because the config descriptor advertises
     // REMOTE_WAKEUP and the host enabled it), then wait for the bus to come
@@ -314,7 +466,9 @@ static void feed(parser_t *p, uint8_t b)
         p->type = b;
         p->csum = b;
         p->got = 0;
-        if (b == TYPE_CONFIG) { p->st = S_LEN; break; } // length-prefixed
+        // length-prefixed (1-byte len into payload[]): config + OTA begin/end
+        if (b == TYPE_CONFIG || b == TYPE_OTA_BEGIN || b == TYPE_OTA_END) { p->st = S_LEN; break; }
+        if (b == TYPE_OTA_DATA) { p->st = S_OTA_L0; break; } // 16-bit len, streamed
         p->need = payload_len(b);
         if (p->need == 0) { p->st = S_SYNC; break; }
         p->st = S_PAYLOAD;
@@ -330,14 +484,30 @@ static void feed(parser_t *p, uint8_t b)
         break;
     case S_CSUM:
         if (b == p->csum) {
-            if (p->type == TYPE_CONTROL) {
-                apply_control(p->payload[0]); // persists + reboots
-            } else if (p->type == TYPE_CONFIG) {
-                apply_config(p->payload, p->need); // persists + reboots
-            } else {
-                send_report(p->type, p->payload);
+            switch (p->type) {
+            case TYPE_CONTROL:   apply_control(p->payload[0]); break; // persists + reboots
+            case TYPE_CONFIG:    apply_config(p->payload, p->need); break; // persists + reboots
+            case TYPE_OTA_BEGIN: ota_begin(p->payload, p->need); break;
+            case TYPE_OTA_END:   ota_end(p->payload, p->need); break;
+            default:             send_report(p->type, p->payload); break;
             }
         }
+        p->st = S_SYNC;
+        break;
+    case S_OTA_L0:
+        p->olen = b; p->csum ^= b; p->st = S_OTA_L1;
+        break;
+    case S_OTA_L1:
+        p->olen |= (uint16_t)b << 8; p->csum ^= b; p->ogot = 0;
+        if (p->olen == 0 || p->olen > sizeof(ota_buf)) { p->st = S_SYNC; break; }
+        p->st = S_OTA_DATA;
+        break;
+    case S_OTA_DATA:
+        ota_buf[p->ogot++] = b; p->csum ^= b;
+        if (p->ogot == p->olen) p->st = S_OTA_CSUM;
+        break;
+    case S_OTA_CSUM:
+        if (b == p->csum) ota_write_chunk(ota_buf, p->olen);
         p->st = S_SYNC;
         break;
     }
@@ -572,9 +742,103 @@ static void wifi_connect_blocking(void)
     mdns_service_add(NULL, "_gohid", "_tcp", CONFIG_HIDBRIDGE_TCP_PORT, NULL, 0);
 }
 
+// ---- Status web server (http://hidbridge.local/) ----
+static const char *reset_reason_str(void)
+{
+    switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:  return "power-on";
+    case ESP_RST_SW:       return "software (e.g. OTA reboot)";
+    case ESP_RST_PANIC:    return "panic";
+    case ESP_RST_INT_WDT:  return "interrupt watchdog";
+    case ESP_RST_TASK_WDT: return "task watchdog";
+    case ESP_RST_BROWNOUT: return "brownout";
+    case ESP_RST_DEEPSLEEP:return "deep sleep wake";
+    default:               return "other";
+    }
+}
+
+static esp_err_t status_get(httpd_req_t *req)
+{
+    const esp_app_desc_t *app = esp_app_get_description();
+    const esp_partition_t *run = esp_ota_get_running_partition();
+    uint32_t s = (uint32_t)(esp_timer_get_time() / 1000000);
+
+    char body[1600];
+    int n = snprintf(body, sizeof(body),
+        "<!doctype html><html><head><meta charset=utf-8>"
+        "<meta http-equiv=refresh content=5><title>hidbridge</title>"
+        "<style>body{font-family:system-ui,sans-serif;margin:2rem;max-width:34rem;color:#222}"
+        "h1{font-size:1.25rem}table{border-collapse:collapse;width:100%%}"
+        "td{padding:.3rem .7rem;border-bottom:1px solid #e5e5e5}"
+        "td:first-child{color:#777;white-space:nowrap}"
+        "td:last-child{text-align:right;font-variant-numeric:tabular-nums}"
+        "small{color:#999}</style></head><body>"
+        "<h1>hidbridge KVM bridge</h1><table>"
+        "<tr><td>firmware</td><td>%s %s</td></tr>"
+        "<tr><td>built</td><td>%s %s</td></tr>"
+        "<tr><td>IDF</td><td>%s</td></tr>"
+        "<tr><td>running slot</td><td>%s</td></tr>"
+        "<tr><td>last reset</td><td>%s</td></tr>"
+        "<tr><td>uptime</td><td>%ud %02u:%02u:%02u</td></tr>"
+        "<tr><td>keystrokes</td><td>%u</td></tr>"
+        "<tr><td>mouse clicks</td><td>%u</td></tr>"
+        "<tr><td>keyboard reports</td><td>%u</td></tr>"
+        "<tr><td>mouse reports</td><td>%u</td></tr>"
+        "</table><p><small>auto-refresh 5s · <a href=/json>/json</a></small></p>"
+        "</body></html>",
+        app->project_name, app->version, app->date, app->time, app->idf_ver,
+        run ? run->label : "?", reset_reason_str(),
+        (unsigned)(s / 86400), (unsigned)((s % 86400) / 3600),
+        (unsigned)((s % 3600) / 60), (unsigned)(s % 60),
+        (unsigned)g_stats.keystrokes, (unsigned)g_stats.clicks,
+        (unsigned)g_stats.kbd_reports, (unsigned)g_stats.mouse_reports);
+
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    httpd_resp_send(req, body, n);
+    return ESP_OK;
+}
+
+static esp_err_t json_get(httpd_req_t *req)
+{
+    const esp_app_desc_t *app = esp_app_get_description();
+    const esp_partition_t *run = esp_ota_get_running_partition();
+    uint32_t s = (uint32_t)(esp_timer_get_time() / 1000000);
+
+    char body[512];
+    int n = snprintf(body, sizeof(body),
+        "{\"firmware\":\"%s\",\"version\":\"%s\",\"built\":\"%s %s\",\"idf\":\"%s\","
+        "\"slot\":\"%s\",\"reset\":\"%s\",\"uptime_s\":%u,"
+        "\"keystrokes\":%u,\"clicks\":%u,\"kbd_reports\":%u,\"mouse_reports\":%u}\n",
+        app->project_name, app->version, app->date, app->time, app->idf_ver,
+        run ? run->label : "?", reset_reason_str(), (unsigned)s,
+        (unsigned)g_stats.keystrokes, (unsigned)g_stats.clicks,
+        (unsigned)g_stats.kbd_reports, (unsigned)g_stats.mouse_reports);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, body, n);
+    return ESP_OK;
+}
+
+static void start_web_server(void)
+{
+    httpd_handle_t srv = NULL;
+    httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+    if (httpd_start(&srv, &cfg) != ESP_OK) {
+        ESP_LOGE(TAG, "web server failed to start");
+        return;
+    }
+    httpd_uri_t root = { .uri = "/", .method = HTTP_GET, .handler = status_get };
+    httpd_uri_t json = { .uri = "/json", .method = HTTP_GET, .handler = json_get };
+    httpd_register_uri_handler(srv, &root);
+    httpd_register_uri_handler(srv, &json);
+    mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
+    ESP_LOGI(TAG, "web server on http://%s.local/", CONFIG_HIDBRIDGE_MDNS_HOSTNAME);
+}
+
 static void net_task(void *arg)
 {
     wifi_connect_blocking();
+    start_web_server();
 
     int ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     int opt = 1;
@@ -597,6 +861,16 @@ static void net_task(void *arg)
         if (cs < 0) continue;
         int one = 1;
         setsockopt(cs, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        // Keepalive: an ungraceful client drop (laptop sleep, Wi-Fi blip, daemon
+        // killed) never sends FIN/RST, so recv() below would block forever and the
+        // single-client accept loop would wedge — pings keep working but no new
+        // connection is ever accepted. Probe a silent peer and tear it down so we
+        // return to accept(). Dead peer detected in ~idle + intvl*cnt seconds.
+        int ka = 1, idle = 5, intvl = 2, cnt = 3;
+        setsockopt(cs, SOL_SOCKET, SO_KEEPALIVE, &ka, sizeof(ka));
+        setsockopt(cs, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+        setsockopt(cs, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+        setsockopt(cs, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
         ESP_LOGI(TAG, "client connected");
         parser_t p = { .st = S_SYNC };
         for (;;) {
@@ -645,4 +919,8 @@ void app_main(void)
     if (read_flag("wifi_en", 1) && wifi_configured()) {  // Wi-Fi if enabled and SSID set
         xTaskCreate(net_task, "net", 4096, NULL, 5, NULL);
     }
+
+    // We reached a working state: confirm this image so the bootloader keeps it.
+    // If an OTA image crashed before here, the next reset rolls back instead.
+    esp_ota_mark_app_valid_cancel_rollback();
 }
