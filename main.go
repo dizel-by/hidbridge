@@ -26,10 +26,43 @@ type kvm struct {
 	rep       *Reporter
 	toggleKey uint16
 	verbose   bool
+	// notify, if set, is called with the new grab state whenever it changes
+	// (from the local toggleKey, an MQTT command, or a forced release). Runs
+	// while k.mu is held, so it must not call back into kvm or block.
+	notify func(grabbed bool)
 }
 
 func newKVM(devs []*device, rep *Reporter, toggleKey uint16, verbose bool) *kvm {
 	return &kvm{devs: devs, pressed: make(map[uint16]bool), rep: rep, toggleKey: toggleKey, verbose: verbose}
+}
+
+// setGrabbed records the new grab state and fires the notify hook (if any) so
+// external observers — the MQTT bridge — learn about every transition, no matter
+// which path caused it. Must hold k.mu.
+func (k *kvm) setGrabbed(v bool) {
+	k.grabbed = v
+	if k.notify != nil {
+		k.notify(v)
+	}
+}
+
+// SetGrab flips the grab to a specific state from outside the evdev path (e.g. an
+// MQTT command from Home Assistant). It complements the local toggleKey — both
+// funnel through applyGrab, so state and side effects stay identical.
+func (k *kvm) SetGrab(on bool) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if k.grabbed == on {
+		return // already there — applyGrab would needlessly re-grab/Reset
+	}
+	k.applyGrab(on)
+}
+
+// ToggleGrab toggles the grab from outside the evdev path (MQTT "TOGGLE").
+func (k *kvm) ToggleGrab() {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	k.applyGrab(!k.grabbed)
 }
 
 // applyGrab grabs or releases every device. Must hold k.mu.
@@ -42,11 +75,11 @@ func (k *kvm) applyGrab(on bool) {
 				for _, prev := range k.devs[:i] {
 					prev.setGrab(false)
 				}
-				k.grabbed = false
+				k.setGrabbed(false)
 				return
 			}
 		}
-		k.grabbed = true
+		k.setGrabbed(true)
 		k.rep.Reset() // start clean
 		fmt.Println(">>> KVM ON  — input grabbed, sway sees nothing (forwarding to ESP32)")
 		return
@@ -57,7 +90,7 @@ func (k *kvm) applyGrab(on bool) {
 			fmt.Fprintf(os.Stderr, "ungrab %s: %v\n", d.path, err)
 		}
 	}
-	k.grabbed = false
+	k.setGrabbed(false)
 	k.rep.Reset() // release any held keys/buttons on the target
 	fmt.Println(">>> KVM OFF — input released back to local session")
 }
@@ -112,7 +145,7 @@ func (k *kvm) releaseLocked(reason string) {
 	for _, d := range k.devs {
 		d.setGrab(false)
 	}
-	k.grabbed = false
+	k.setGrabbed(false)
 	k.rep.ClearState() // target is gone — just drop local state, don't send
 	fmt.Printf(">>> %s — input released; press %s to re-grab\n", reason, keyName(k.toggleKey))
 }
@@ -513,12 +546,18 @@ func main() {
 	}
 	go k.watchLink(sink)        // release the grab if the bridge link drops
 	go k.superviseDevices(&cfg) // re-attach devices that disappear and come back
+
+	var mb *mqttBridge
+	if cfg.MQTT.Broker != "" {
+		mb, _ = startMQTT(cfg.MQTT, k, sink) // logs its own errors; never fatal
+	}
 	fmt.Println("---")
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	<-sig
 	fmt.Println("\nshutting down…")
+	mb.Close() // mark offline in HA + disconnect (no-op if MQTT disabled)
 	// Release grab before exit so we never leave the session without input.
 	// (The kernel also drops the grab when the fds close on exit, but be explicit.)
 	k.mu.Lock()

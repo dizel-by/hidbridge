@@ -9,5 +9,14 @@
   "serial": "/dev/ttyUSB0",
   "ble": "hidbridge",
   "net": "hidbridge.local:3232",
-  "otaToken": "changeme"
+  "otaToken": "changeme",
+  "_mqtt_comment": "Optional. Set broker to connect to Home Assistant: publishes MQTT discovery (a 'KVM grab' switch + 'Bridge link' sensor) and lets HA toggle the grab — in addition to the local toggleKey. Omit/empty broker to disable. nodeID/clientID default to the hostname.",
+  "mqtt": {
+    "broker": "tcp://homeassistant.local:1883",
+    "user": "hidbridge",
+    "password": "changeme",
+    "baseTopic": "hidbridge",
+    "discoveryPrefix": "homeassistant",
+    "deviceName": "HID Bridge"
+  }
 }

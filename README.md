@@ -175,7 +175,10 @@ cp config.example.json config.json
   "serial": "/dev/ttyUSB0",    // default for bare -serial
   "ble": "hidbridge",          // default for bare -ble
   "net": "hidbridge.local:3232",// default for bare -net
-  "otaToken": "changeme"       // shared secret for -ota (must match board's OTA_TOKEN)
+  "otaToken": "changeme",      // shared secret for -ota (must match board's OTA_TOKEN)
+  "mqtt": {                    // optional — see "Home Assistant (MQTT)" below
+    "broker": "tcp://homeassistant.local:1883"
+  }
 }
 ```
 
@@ -197,6 +200,56 @@ To find your device names, run with no transport (it prints what it finds) or
 
 You can also bake defaults into `firmware/esp32s3_hid_idf/.env`; see the firmware
 README.
+
+## Home Assistant (MQTT)
+
+Set `mqtt.broker` in `config.json` and the daemon connects to your broker and
+announces itself to Home Assistant via **MQTT discovery** — no YAML, the device
+appears on its own:
+
+- **`switch` "KVM grab"** — toggles the grab on/off. This is an *extra* control
+  surface; the local `toggleKey` (KEY_CALC) keeps working, and the switch always
+  reflects the real state (flip it with the hotkey and HA updates too).
+- **`binary_sensor` "Bridge link"** — connectivity: is the ESP32 link
+  (USB/BLE/Wi-Fi) up? Goes unavailable when the daemon stops (MQTT last-will).
+
+```jsonc
+"mqtt": {
+  "broker": "tcp://homeassistant.local:1883", // tcp:// , tls:// or ws://
+  "user": "hidbridge",
+  "password": "secret",
+  "baseTopic": "hidbridge",          // default
+  "discoveryPrefix": "homeassistant",// must match HA's MQTT discovery prefix
+  "nodeID": "desktop",               // default: hostname; unique per machine
+  "deviceName": "HID Bridge"         // shown in HA
+}
+```
+
+Topics (base = `<baseTopic>/<nodeID>`):
+
+| topic | dir | payload |
+|---|---|---|
+| `<base>/grab/set` | in | `ON` / `OFF` / `TOGGLE` |
+| `<base>/grab/state` | out | `ON` / `OFF` (retained) |
+| `<base>/link/state` | out | `online` / `offline` (retained) |
+| `<base>/status` | out | `online` / `offline` (availability / LWT) |
+
+**Drive it from a Zigbee button:** the button doesn't replace KEY_CALC, it adds
+to it. In HA, add an automation that maps the button press to the grab switch —
+e.g. trigger on the button's MQTT/Zigbee event, action *Switch → Toggle* on the
+`KVM grab` entity (or publish `TOGGLE` to `<base>/grab/set` directly):
+
+```yaml
+automation:
+  - alias: "Zigbee button toggles KVM"
+    trigger:
+      - platform: state
+        entity_id: sensor.my_button_action   # zigbee2mqtt 'action'
+        to: "single"
+    action:
+      - service: switch.toggle
+        target: { entity_id: switch.hid_bridge_kvm_grab }
+```
 
 ## Diagnostics
 

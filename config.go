@@ -25,6 +25,65 @@ type Config struct {
 	// OTAToken is the shared secret sent with -ota firmware updates; it must
 	// match the board's OTA_TOKEN (.env / Kconfig).
 	OTAToken string `json:"otaToken"`
+	// MQTT, when Broker is set, connects the daemon to a broker so Home
+	// Assistant can toggle the KVM grab (in addition to the local toggleKey)
+	// and see its state. Empty Broker disables the whole MQTT path.
+	MQTT MQTTConfig `json:"mqtt"`
+}
+
+// MQTTConfig describes the Home Assistant / MQTT integration. Only Broker is
+// required; everything else has a sensible default (filled by withDefaults).
+type MQTTConfig struct {
+	Broker          string `json:"broker"`          // tcp://host:1883 (or tls://, ws://)
+	User            string `json:"user"`            // optional
+	Password        string `json:"password"`        // optional
+	ClientID        string `json:"clientID"`        // default "hidbridge-<node>"
+	BaseTopic       string `json:"baseTopic"`       // default "hidbridge"
+	DiscoveryPrefix string `json:"discoveryPrefix"` // default "homeassistant"
+	NodeID          string `json:"nodeID"`          // default hostname; unique per machine
+	DeviceName      string `json:"deviceName"`      // default "HID Bridge"
+}
+
+// withDefaults fills empty optional fields. NodeID/ClientID derive from the
+// hostname so two machines on one broker don't collide.
+func (m MQTTConfig) withDefaults() MQTTConfig {
+	host, _ := os.Hostname()
+	if host == "" {
+		host = "host"
+	}
+	if m.NodeID == "" {
+		m.NodeID = sanitizeID(host)
+	}
+	if m.ClientID == "" {
+		m.ClientID = "hidbridge-" + m.NodeID
+	}
+	if m.BaseTopic == "" {
+		m.BaseTopic = "hidbridge"
+	}
+	if m.DiscoveryPrefix == "" {
+		m.DiscoveryPrefix = "homeassistant"
+	}
+	if m.DeviceName == "" {
+		m.DeviceName = "HID Bridge"
+	}
+	return m
+}
+
+// sanitizeID keeps only chars safe for MQTT topics / HA unique_ids.
+func sanitizeID(s string) string {
+	b := make([]rune, 0, len(s))
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			b = append(b, r)
+		default:
+			b = append(b, '_')
+		}
+	}
+	if len(b) == 0 {
+		return "host"
+	}
+	return string(b)
 }
 
 func defaultConfig() Config {
